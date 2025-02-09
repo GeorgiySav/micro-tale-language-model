@@ -1,11 +1,11 @@
 # imports
+import inspect
 import json
-import math
-import time
 
 import torch
 
 from tokenizers import Tokenizer
+from tqdm import tqdm
 from transformers import PreTrainedTokenizerFast
 
 from model import GPT, GPTConfig
@@ -20,7 +20,7 @@ if torch.cuda.is_available():
 print(f'Using device: {device}')
 if device == 'cuda':
   print(f'Device name: {torch.cuda.get_device_name(device=device)}')
-torch.set_float32_matmul_precision('high')
+#torch.set_float32_matmul_precision('high')
 # -------------------------------------
 
 
@@ -38,22 +38,12 @@ dropout    = hp['dropout']
 
 B = hp["mini_batch_size"]
 T = block_size
-total_batch_size = hp['total_batch_size']
-assert total_batch_size % (B*T) == 0, 'Make sure total_batch_size is divisible by B*T'
-grad_accum_steps = total_batch_size // (B*T)
-print(f'Calculate gradient accumulation steps: {grad_accum_steps}')
+epochs = hp["epochs"]
+lr = hp["learning_rate"]
 
-max_lr = hp["learning_rate"]
-min_lr = max_lr * 0.1
-warmup_steps = hp["warmup_steps"]
-max_steps = hp["max_steps"]
-weight_decay = hp["weight_decay"]
-grad_clipping = hp["grad_clipping"]
-
-val_interval = hp['val_interval']
+log_interval = hp['log_interval']
 val_steps = hp['val_steps']
-gen_interval = hp['val_interval']
-checkpoint_interval = hp['checkpoint_interval']
+gen_interval = hp['gen_interval']
 # -------------------------------------
 
 
@@ -84,90 +74,74 @@ config = GPTConfig(
 model = GPT(config)
 model.to(device)
 
-checkpoint = torch.load('checkpoints/mtlm-complete-0602.pt', weights_only=True)
-model.load_state_dict(checkpoint['model'])
+#checkpoint = torch.load('checkpoints/mtlm-complete.pt', weights_only=True)
+#model.load_state_dict(checkpoint['model'])
 # -------------------------------------
 
 
 # training
-def get_lr(it):
-  # 1) linear warmup for warmup_ters steps
-  if it < warmup_steps:
-    return max_lr * (it+1) / warmup_steps
-  # 2) if it > max_steps, return min learning rate
-  if it > max_steps:
-    return min_lr
-  # 3) in between, use cosine decay down to min learning rate
-  decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-  assert 0 <= decay_ratio <= 1
-  coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-  return min_lr + coeff * (max_lr - min_lr)
+fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+use_fused = fused_available and 'cuda' in device
+print(f'Using fused AdamW: {use_fused}')
+optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), eps=1e-8)
 
-optimizer = model.configure_optimizers(weight_decay=weight_decay, learning_rate=max_lr, device=device)
+num_training_steps = epochs * len(dataloader.train_dataloader)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=num_training_steps)
 
-for step in range(max_steps):
-  t0 = time.time()
+progress_bar = tqdm(range(num_training_steps), desc='Training')
 
-  if step % val_interval == 0 and step != 0:
-    val_loss_accum = 0.0
-    model.eval()
-    with torch.no_grad():
-      for _ in range(val_steps):
-        x, y = dataloader.next_batch(split='test')
-        x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
-        loss = loss / val_steps
-        val_loss_accum += loss.detach()
-    print(f'Validation loss: {val_loss_accum.item():.4f}')
-
-  if step % gen_interval == 0 and step != 0:
-    model.eval()
-    prompt = wrapped_tokenizer.encode('<|start_story|>Once upon a time, ')
-    prompt = torch.tensor([prompt], dtype=torch.long, device=device)
-    response = model.generate(prompt=prompt, max_new_tokens=100, topk=10)
-    tokens = response[0].tolist()
-    decoded = wrapped_tokenizer.decode(tokens)
-    print(f'Generation: {decoded}')
-
-  if step % checkpoint_interval == 0 and step != 0:
-    checkpoint = {
-      "step": step,
-      "model": model.state_dict(),
-      "optimizer": optimizer.state_dict(),
-      "hyperparameters": hp
-    }
-    torch.save(checkpoint, f"checkpoints/mtlm-checkpoint-{step}.pt")
-
+for epoch in range(epochs):
   model.train()
-  optimizer.zero_grad()
-  loss_accum = 0.0
-  for micro_step in range(grad_accum_steps):
-    x, y = dataloader.next_batch(split='train')
+  for batch in dataloader.train_dataloader:
+    x = batch['input_ids'][:, :-1]
+    y = batch['input_ids'][:, 1:]
+
     x, y = x.to(device), y.to(device)
     logits, loss = model(x, y)
-    loss = loss / grad_accum_steps
-    loss_accum += loss.detach()
+  
+    optimizer.zero_grad(set_to_none=True)
     loss.backward()
 
-  norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clipping)
-  # determine learning rate
-  lr = get_lr(step)
-  for param_group in optimizer.param_groups:
-    param_group['lr'] = lr 
-  optimizer.step()
+    optimizer.step()
+    scheduler.step()
+    progress_bar.update(1)
 
-  if device == 'cuda': 
-    torch.cuda.synchronize()
+    if progress_bar.n % log_interval == 0:
+      print()
+      print(f'Train loss: {loss.item():.6f} | lr: {scheduler.get_last_lr()[0]:.4e}')
+    if progress_bar.n % gen_interval == 0:
+      prompt = wrapped_tokenizer.encode('<|start_story|>Once upon a time, ')
+      prompt = torch.tensor([prompt], dtype=torch.long, device=device)
+      response = model.generate(prompt=prompt, max_new_tokens=100, topk=10)
+      tokens = response[0].tolist()
+      decoded = wrapped_tokenizer.decode(tokens)
+      print()
+      print(f'Generation: {decoded}')
 
-  t1 = time.time()
-  dt = t1 - t0
-  tokens_per_sec = (B * T * grad_accum_steps) / dt
-  print(f'Step {step:4d} | Loss: {loss_accum.item():.6f} | Lr: {lr:.4e} | Norm: {norm:.4f} | Time: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec}')
+  with torch.no_grad():
+    model.eval()
+    losses = torch.zeros(len(dataloader.val_dataloader), device=device)
+    for i, batch in enumerate(dataloader.val_dataloader):
+      x = batch['input_ids'][:, :-1]
+      y = batch['input_ids'][:, 1:]
+      x, y = x.to(device), y.to(device)
+      logits, loss = model(x, y)
+      losses[i] = loss.item()
+    print()
+    print(f'Validation loss: {loss.mean():.4f}')
+
+  checkpoint = {
+    "epoch": epoch,
+    "model": model.state_dict(),
+    "optimizer": optimizer.state_dict(),
+    "hyperparameters": hp
+  }
+  torch.save(checkpoint, f"checkpoints/mtlm-checkpoint-{epoch}-epoch.pt")
 # -------------------------------------
 
 # save model
 checkpoint = {
-  "step": max_steps,
+  "epoch": epochs,
   "model": model.state_dict(),
   "optimizer": optimizer.state_dict(),
   "hyperparameters": hp

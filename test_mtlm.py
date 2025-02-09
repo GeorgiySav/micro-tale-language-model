@@ -1,6 +1,7 @@
 # imports
 import torch
-from tokenizers import Tokenizer, decoders
+from tokenizers import Tokenizer
+from transformers import PreTrainedTokenizerFast
 
 from model import GPT, GPTConfig
 # ------------------------------------
@@ -18,7 +19,6 @@ torch.set_float32_matmul_precision('high')
 # load dataset
 tokenizer_file = 'tokenizer.json'
 tokenizer = Tokenizer.from_file(tokenizer_file)
-from transformers import PreTrainedTokenizerFast
 tokenizer = PreTrainedTokenizerFast(
   tokenizer_object=tokenizer,
   bos_token='<|start_story|>',
@@ -46,12 +46,15 @@ config = GPTConfig(
 model = GPT(config=config)
 model.to(device)
 model.load_state_dict(checkpoint['model'])
+
+num_params = sum(p.numel() for p in model.parameters())/1e6
+print(f'Loaded model with {num_params:.3f}M parameters')
 # -----------------------------
 
 # generate a micro tale
-prompt = 'Once upon a time, '
+prompt = '<|start_story|>'
 prompt = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=device)
-response = model.generate(prompt=prompt, max_new_tokens=500, topk=50)
+response = model.generate(prompt=prompt, max_new_tokens=512, topk=50)
 tokens = response[0].tolist()
 decoded = tokenizer.decode(tokens, skip_special_tokens=True)
 print(decoded)
